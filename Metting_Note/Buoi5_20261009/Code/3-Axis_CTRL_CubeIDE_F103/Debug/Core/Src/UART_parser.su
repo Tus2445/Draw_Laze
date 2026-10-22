@@ -1,0 +1,5 @@
+../Core/Src/UART_parser.c:9:6:UART_Queue_Init	16	static
+../Core/Src/UART_parser.c:17:6:UART_Queue_Push	24	static
+../Core/Src/UART_parser.c:27:9:UART_Queue_Pop	16	static
+../Core/Src/UART_parser.c:38:6:UART_Parse_Command	24	static
+../Core/Src/UART_parser.c:74:6:HAL_UART_RxCpltCallback	16	static
