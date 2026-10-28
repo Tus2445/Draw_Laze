@@ -65,6 +65,14 @@ void Error_Handler(void);
 #define PUL_Y_GPIO_Port GPIOA
 #define DIR_Y_Pin GPIO_PIN_4
 #define DIR_Y_GPIO_Port GPIOA
+#define MIN_X_Pin GPIO_PIN_12
+#define MIN_X_GPIO_Port GPIOB
+#define MAX_X_Pin GPIO_PIN_13
+#define MAX_X_GPIO_Port GPIOB
+#define MIN_Y_Pin GPIO_PIN_14
+#define MIN_Y_GPIO_Port GPIOB
+#define MAX_Y_Pin GPIO_PIN_15
+#define MAX_Y_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

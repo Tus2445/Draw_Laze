@@ -23,20 +23,25 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+// Cấu trúc lưu 1 lệnh di chuyển gồm số vòng trục X và trục Y (âm hoặc dương)
+typedef struct {
+  int32_t rev_x;
+  int32_t rev_y;
+} MotorCmd_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define STEPS_PER_REV  1600                  // 1 vòng = 1600 bước (xung)
-#define STEPS_5_REV    (5 * STEPS_PER_REV)   // 5 vòng = 8000 bước
-#define STEPS_3_REV    (3 * STEPS_PER_REV)   // 3 vòng = 4800 bước
-
-#define QUEUE_SIZE     16                    // Lưu tối đa 15 lệnh chờ trong hàng đợi
+#define STEPS_PER_REV   1600                 // 1 vòng = 1600 bước (xung)
+#define QUEUE_SIZE      16                   // Lưu tối đa 15 lệnh chờ trong hàng đợi động cơ
+#define RAW_FIFO_SIZE   128                  // Bộ đệm vòng chứa byte thô từ ngắt UART
+#define LINE_BUF_SIZE   32                   // Độ dài tối đa của 1 chuỗi lệnh (VD: "X-10Y20")
+#define UART_TIMEOUT_MS 30                   // Sau 30ms không có ký tự mới -> Tự hiểu là hết câu lệnh
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,17 +57,27 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 uint8_t rx_data = 0;
 
-// Các biến quản lý Hàng đợi FIFO (Ring Buffer)
-volatile uint8_t cmd_queue[QUEUE_SIZE];
+// 1. Bộ đệm vòng chứa byte thô (Raw Byte Ring Buffer) giao tiếp giữa ISR UART và while(1)
+volatile uint8_t raw_rx_fifo[RAW_FIFO_SIZE];
+volatile uint8_t raw_head = 0;
+volatile uint8_t raw_tail = 0;
+volatile uint8_t is_receiving_cmd = 0;  // Đánh dấu đang gõ dở câu lệnh (để phân biệt số '0' trong "X0Y3" với lệnh dừng '0')
+// volatile uint32_t last_rx_tick = 0;     // Thời điểm nhận byte cuối cùng (dùng cho Timeout tự chốt lệnh)
+
+// Bộ đệm lắp ghép chuỗi chỉ dùng trong while(1)
+char line_buf[LINE_BUF_SIZE];
+uint8_t line_idx = 0;
+
+// 2. Hàng đợi FIFO chứa các lệnh động cơ đã giải mã (Motor Command Queue)
+MotorCmd_t cmd_queue[QUEUE_SIZE];
 volatile uint8_t q_head = 0;            // Vị trí ghi lệnh mới vào
 volatile uint8_t q_tail = 0;            // Vị trí lấy lệnh cũ ra chạy
 
-// Các cờ thông báo sự kiện cho while(1)
+// 3. Các cờ thông báo sự kiện
 volatile uint8_t stop_flag = 0;         // Cờ dừng khẩn cấp khi nhận '0'
-volatile uint8_t notify_rx_cmd = 0;     // Lưu ký tự vừa nhận để in thông báo "Da nhan"
-volatile uint8_t queue_full_flag = 0;   // Cờ báo tràn hàng đợi
+volatile uint8_t cmd_done_flag = 0;     // Cờ báo vừa chạy xong 1 lệnh từ Timer 2
 
-// Các biến điều khiển Stepper theo từng bước và trạng thái nửa chu kỳ xung
+// 4. Các biến điều khiển Stepper trong ngắt Timer 2
 volatile uint32_t steps_left_X = 0;     // Số bước (xung) còn lại của trục X
 volatile uint32_t steps_left_Y = 0;     // Số bước (xung) còn lại của trục Y
 volatile uint8_t pulse_state_X = 0;     // 0: Sắp xuất mức SET, 1: Sắp xuất mức RESET
@@ -76,7 +91,8 @@ static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+void Emergency_Stop_ISR(void);
+void Parse_And_Push_Command(char *cmd_str);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -84,6 +100,89 @@ static void MX_USART1_UART_Init(void);
 void UART_SendString(char *str)
 {
   HAL_UART_Transmit(&huart1, (uint8_t *)str, strlen(str), 100);
+}
+
+// Hàm dừng khẩn cấp gọi nhanh trong ngắt
+void Emergency_Stop_ISR(void)
+{
+  HAL_TIM_Base_Stop_IT(&htim2);
+  steps_left_X = 0;
+  steps_left_Y = 0;
+  pulse_state_X = 0;
+  pulse_state_Y = 0;
+  is_motor_busy = 0;
+  cmd_done_flag = 0;
+
+  // Xóa toàn bộ hàng đợi lệnh và bộ đệm nhận
+  q_head = 0;
+  q_tail = 0;
+  raw_head = 0;
+  raw_tail = 0;
+  is_receiving_cmd = 0;
+
+  HAL_GPIO_WritePin(GPIOA, PUL_X_Pin | PUL_Y_Pin, GPIO_PIN_RESET);
+  stop_flag = 1;
+}
+
+// Hàm phân tích chuỗi lệnh (Chạy hoàn toàn trong while(1), KHÔNG chạy trong ngắt)
+void Parse_And_Push_Command(char *cmd_str)
+{
+  // Kiểm tra nếu chuỗi gửi xuống là "0"
+  if (strcmp(cmd_str, "0") == 0)
+  {
+    __disable_irq();
+    Emergency_Stop_ISR();
+    __enable_irq();
+    return;
+  }
+
+  // Phân tích cú pháp X<số>Y<số> (hỗ trợ cả chữ hoa lẫn chữ thường)
+  char *ptr = cmd_str;
+  if (*ptr == 'X' || *ptr == 'x')
+  {
+    ptr++; // Dịch qua chữ 'X'
+    char *end_x;
+    long val_x = strtol(ptr, &end_x, 10);
+
+    // Kiểm tra ngay sau số X có phải là chữ 'Y' không
+    if (end_x != ptr && (*end_x == 'Y' || *end_x == 'y'))
+    {
+      ptr = end_x + 1; // Dịch qua chữ 'Y'
+      char *end_y;
+      long val_y = strtol(ptr, &end_y, 10);
+
+      // Nếu đọc số Y thành công và đã kết thúc chuỗi
+      if (end_y != ptr && *end_y == '\0')
+      {
+        uint8_t next_head = (q_head + 1) % QUEUE_SIZE;
+        if (next_head != q_tail) // Kiểm tra FIFO lệnh còn chỗ trống không
+        {
+          cmd_queue[q_head].rev_x = (int32_t)val_x;
+          cmd_queue[q_head].rev_y = (int32_t)val_y;
+          q_head = next_head;
+
+          char msg[96];
+          if (is_motor_busy)
+          {
+            sprintf(msg, "Da nhan lenh: X%ldY%ld (Da luu vao FIFO, cho lenh cu xong...)\r\n", val_x, val_y);
+          }
+          else
+          {
+            sprintf(msg, "Da nhan lenh: X%ldY%ld\r\n", val_x, val_y);
+          }
+          UART_SendString(msg);
+        }
+        else
+        {
+          UART_SendString("Canh bao: Hang doi FIFO da day!\r\n");
+        }
+        return;
+      }
+    }
+  }
+
+  // Nếu không khớp định dạng chuẩn thì báo lỗi
+  UART_SendString("Loi cu phap! Vui long gui dung dang: X1Y1, X0Y3, X-1Y-1 hoac 0.\r\n");
 }
 /* USER CODE END 0 */
 
@@ -120,106 +219,152 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart1, &rx_data, 1);
-  UART_SendString("He thong san sang! Gui 1-5 de chay, 0 de dung.\r\n");
+  UART_SendString("He thong san sang!\r\n");
+  UART_SendString("Gui lenh theo cu phap X<so_vong>Y<so_vong> (VD: X1Y1, X0Y3, X-1Y-1).\r\n");
+  UART_SendString("Gui 0 de DUNG KHAN CAP.\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  // 1. XỬ LÝ DỪNG KHẨN CẤP (Khi nhận lệnh '0')
-	      if (stop_flag)
-	      {
-	        stop_flag = 0;
-	        UART_SendString("Da nhan: 0 -> DUNG KHAN CAP & XOA HANG DOI!\r\n");
-	      }
+    // =========================================================================
+    // 1. XỬ LÝ DỪNG KHẨN CẤP (Khi nhận lệnh '0')
+    // =========================================================================
+    if (stop_flag)
+    {
+      stop_flag = 0;
+      line_idx = 0; // Xóa luôn chuỗi đang lắp ghép dở (nếu có)
+      UART_SendString("Da nhan: 0 -> DUNG KHAN CAP & XOA HANG DOI!\r\n");
+    }
 
-	      // 2. IN THÔNG BÁO NGAY KHI NHẬN LỆNH MỚI VÀO HÀNG ĐỢI ('1' -> '5')
-	      if (notify_rx_cmd != 0)
-	      {
-	        uint8_t cmd_in = notify_rx_cmd;
-	        notify_rx_cmd = 0;
+    // =========================================================================
+    // 2. LẤY BYTE THÔ TỪ UART FIFO RA ĐỂ LẮP GHÉP & XỬ LÝ CHUỖI TRONG WHILE(1)
+    // =========================================================================
+    while (raw_tail != raw_head)
+    {
+      uint8_t ch = raw_rx_fifo[raw_tail];
+      raw_tail = (raw_tail + 1) % RAW_FIFO_SIZE;
 
-	        char msg[64];
-	        if (is_motor_busy)
-	        {
-	          sprintf(msg, "Da nhan lenh: %c (Da luu vao FIFO, cho lenh cu xong...)\r\n", cmd_in);
-	        }
-	        else
-	        {
-	          sprintf(msg, "Da nhan lenh: %c\r\n", cmd_in);
-	        }
-	        UART_SendString(msg);
-	      }
+      // Nếu gặp ký tự kết thúc câu lệnh (\r, \n hoặc ';')
+      if (ch == '\r' || ch == '\n' || ch == ';')
+      {
+        if (line_idx > 0)
+        {
+          line_buf[line_idx] = '\0';
+          line_idx = 0;
+          Parse_And_Push_Command(line_buf);
+        }
+      }
+      else if (ch != ' ') // Bỏ qua khoảng trắng
+      {
+        if (line_idx < (LINE_BUF_SIZE - 1))
+        {
+          line_buf[line_idx++] = (char)ch;
+        }
+        else
+        {
+          // Chuỗi quá dài -> Xóa bộ đệm dòng và báo lỗi
+          line_idx = 0;
+          UART_SendString("Loi: Chuoi lenh qua dai!\r\n");
+        }
+      }
+    }
 
-	      // Báo lỗi nếu gửi quá 15 lệnh liên tiếp khi chưa chạy xong
-	      if (queue_full_flag)
-	      {
-	        queue_full_flag = 0;
-	        UART_SendString("Canh bao: Hang doi FIFO da day!\r\n");
-	      }
+    // Tự động chốt lệnh nếu người dùng gửi trên Hercules mà KHÔNG có Enter hay ';'
 
-	      // 3. LẤY LỆNH TỪ HÀNG ĐỢI RA CHẠY (Chỉ lấy khi động cơ ĐANG RẢNH và FIFO CÓ LỆNH)
-	      if (!is_motor_busy && (q_head != q_tail))
-	      {
-	        is_motor_busy = 1; // Khóa trạng thái bận NGAY LẬP TỨC
+    // =========================================================================
+    // 3. KIỂM TRA & BÁO CÁO KHI THỰC THI XONG LỆNH
+    // =========================================================================
+    if (cmd_done_flag)
+    {
+      cmd_done_flag = 0;
 
-	        // Rút lệnh đầu tiên trong hàng đợi ra (Pop)
-	        uint8_t current_cmd = cmd_queue[q_tail];
-	        q_tail = (q_tail + 1) % QUEUE_SIZE;
+      // Nếu trong hàng đợi vẫn còn lệnh tiếp theo đang chờ
+      if (q_head != q_tail)
+      {
+        UART_SendString("-> Da xong 1 lenh, chuan bi chay lenh tiep theo trong FIFO...\r\n");
+      }
+      else
+      {
+        // Khi hàng đợi đã trống hoàn toàn
+        UART_SendString("==> HE THONG DA THUC THI XONG TAT CA CAC LENH! <==\r\n");
+      }
+    }
 
-	        char run_msg[64];
-	        sprintf(run_msg, "Dang thuc thi lenh %c...\r\n", current_cmd);
-	        UART_SendString(run_msg);
+    // =========================================================================
+    // 4. LẤY LỆNH TỪ HÀNG ĐỢI RA CHẠY (Khi động cơ ĐANG RẢNH và FIFO CÓ LỆNH)
+    // =========================================================================
+    if (!is_motor_busy && (q_head != q_tail))
+    {
+      is_motor_busy = 1; // Khóa trạng thái bận NGAY LẬP TỨC
 
-	        // Nghỉ 50ms để ổn định cơ khí
-	        HAL_Delay(50);
+      // Rút lệnh đầu tiên trong hàng đợi ra (Pop)
+      MotorCmd_t current_cmd = cmd_queue[q_tail];
+      q_tail = (q_tail + 1) % QUEUE_SIZE;
 
-	        // Nếu trong 50ms vừa rồi KHÔNG có lệnh dừng khẩn cấp '0' thì mới nạp bước và chạy
-	        if (stop_flag == 0)
-	        {
-	          HAL_GPIO_WritePin(GPIOA, PUL_X_Pin | PUL_Y_Pin, GPIO_PIN_RESET);
-	          pulse_state_X = 0;
-	          pulse_state_Y = 0;
+      char run_msg[80];
+      sprintf(run_msg, "Dang thuc thi: X = %ld vong, Y = %ld vong...\r\n", current_cmd.rev_x, current_cmd.rev_y);
+      UART_SendString(run_msg);
 
-	          switch (current_cmd)
-	          {
-	            case '1': // X quay 5 vòng (DIR_X = SET), Y đứng yên
-	              HAL_GPIO_WritePin(GPIOA, DIR_X_Pin, GPIO_PIN_SET);
-	              steps_left_X = STEPS_5_REV;
-	              steps_left_Y = 0;
-	              break;
+      // Nghỉ 50ms để ổn định cơ khí
+      HAL_Delay(50);
 
-	            case '2': // Y quay 5 vòng (DIR_Y = RESET), X đứng yên
-	              HAL_GPIO_WritePin(GPIOA, DIR_Y_Pin, GPIO_PIN_RESET);
-	              steps_left_X = 0;
-	              steps_left_Y = STEPS_5_REV;
-	              break;
+      // Nếu trong 50ms vừa rồi KHÔNG có lệnh dừng khẩn cấp '0' thì mới nạp bước và chạy
+      if (stop_flag == 0)
+      {
+        HAL_GPIO_WritePin(GPIOA, PUL_X_Pin | PUL_Y_Pin, GPIO_PIN_RESET);
+        pulse_state_X = 0;
+        pulse_state_Y = 0;
 
-	            case '3': // X quay 5 vòng (DIR_X = RESET), Y đứng yên
-	              HAL_GPIO_WritePin(GPIOA, DIR_X_Pin, GPIO_PIN_RESET);
-	              steps_left_X = STEPS_5_REV;
-	              steps_left_Y = 0;
-	              break;
+        // --- CẤU HÌNH CHIỀU QUAY & SỐ BƯỚC TRỤC X ---
+        // Đi lên (>0) -> DIR_X = SET | Đi xuống (<0) -> DIR_X = RESET
+        if (current_cmd.rev_x > 0)
+        {
+          HAL_GPIO_WritePin(GPIOA, DIR_X_Pin, GPIO_PIN_SET);
+          steps_left_X = (uint32_t)(current_cmd.rev_x) * STEPS_PER_REV;
+        }
+        else if (current_cmd.rev_x < 0)
+        {
+          HAL_GPIO_WritePin(GPIOA, DIR_X_Pin, GPIO_PIN_RESET);
+          steps_left_X = (uint32_t)(-current_cmd.rev_x) * STEPS_PER_REV;
+        }
+        else
+        {
+          steps_left_X = 0;
+        }
 
-	            case '4': // Y quay 5 vòng (DIR_Y = SET), X đứng yên
-	              HAL_GPIO_WritePin(GPIOA, DIR_Y_Pin, GPIO_PIN_SET);
-	              steps_left_X = 0;
-	              steps_left_Y = STEPS_5_REV;
-	              break;
+        // --- CẤU HÌNH CHIỀU QUAY & SỐ BƯỚC TRỤC Y ---
+        // Đi lên (>0) -> DIR_Y = RESET | Đi xuống (<0) -> DIR_Y = SET
+        if (current_cmd.rev_y > 0)
+        {
+          HAL_GPIO_WritePin(GPIOA, DIR_Y_Pin, GPIO_PIN_RESET);
+          steps_left_Y = (uint32_t)(current_cmd.rev_y) * STEPS_PER_REV;
+        }
+        else if (current_cmd.rev_y < 0)
+        {
+          HAL_GPIO_WritePin(GPIOA, DIR_Y_Pin, GPIO_PIN_SET);
+          steps_left_Y = (uint32_t)(-current_cmd.rev_y) * STEPS_PER_REV;
+        }
+        else
+        {
+          steps_left_Y = 0;
+        }
 
-	            case '5': // Cả 2 cùng quay 3 vòng đi lên (DIR_X = SET, DIR_Y = RESET)
-	              HAL_GPIO_WritePin(GPIOA, DIR_X_Pin, GPIO_PIN_SET);
-	              HAL_GPIO_WritePin(GPIOA, DIR_Y_Pin, GPIO_PIN_RESET);
-	              steps_left_X = STEPS_3_REV;
-	              steps_left_Y = STEPS_3_REV;
-	              break;
-	          }
-
-	          __HAL_TIM_SET_COUNTER(&htim2, 0);
-	          HAL_TIM_Base_Start_IT(&htim2);
-	        }
-	      }
+        // Khởi động Timer 2 nếu có ít nhất 1 trục cần quay
+        if (steps_left_X > 0 || steps_left_Y > 0)
+        {
+          __HAL_TIM_SET_COUNTER(&htim2, 0);
+          HAL_TIM_Base_Start_IT(&htim2);
+        }
+        else
+        {
+          // Nếu gửi X0Y0 (0 bước) thì báo hoàn thành luôn không cần bật Timer
+          is_motor_busy = 0;
+          cmd_done_flag = 1;
+        }
+      }
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -359,6 +504,7 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, PUL_X_Pin|DIR_X_Pin|PUL_Y_Pin|DIR_Y_Pin, GPIO_PIN_RESET);
@@ -370,6 +516,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : MIN_X_Pin MAX_X_Pin MIN_Y_Pin MAX_Y_Pin */
+  GPIO_InitStruct.Pin = MIN_X_Pin|MAX_X_Pin|MIN_Y_Pin|MAX_Y_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
@@ -377,37 +529,34 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-// 1. Ngắt nhận UART: Đẩy lệnh vào FIFO hoặc Dừng khẩn cấp
+// 1. Ngắt nhận UART: CỰC KỲ GỌN NHẸ - Chỉ đẩy byte thô vào Ring Buffer hoặc bắt lệnh dừng khẩn cấp '0'
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1)
   {
-    if (rx_data == '0')
+    // Nếu không phải đang gõ dở lệnh "X..." mà nhận được ký tự '0' -> Dừng khẩn cấp NGAY LẬP TỨC!
+    if (!is_receiving_cmd && rx_data == '0')
     {
-      // Dừng ngay lập tức trong ngắt và xóa sạch hàng đợi FIFO
-      HAL_TIM_Base_Stop_IT(&htim2);
-      steps_left_X = 0;
-      steps_left_Y = 0;
-      pulse_state_X = 0;
-      pulse_state_Y = 0;
-      is_motor_busy = 0;
-      q_head = 0;
-      q_tail = 0;
-      HAL_GPIO_WritePin(GPIOA, PUL_X_Pin | PUL_Y_Pin, GPIO_PIN_RESET);
-      stop_flag = 1;
+      Emergency_Stop_ISR();
     }
-    else if (rx_data >= '1' && rx_data <= '5')
+    else
     {
-      uint8_t next_head = (q_head + 1) % QUEUE_SIZE;
-      if (next_head != q_tail) // Kiểm tra FIFO còn chỗ trống không
+      // Cập nhật trạng thái đang nhận khung lệnh
+      if (rx_data == '\r' || rx_data == '\n' || rx_data == ';')
       {
-        cmd_queue[q_head] = rx_data; // Đẩy lệnh vào FIFO (Push)
-        q_head = next_head;
-        notify_rx_cmd = rx_data;     // Báo cho while(1) in "Da nhan lenh"
+        is_receiving_cmd = 0; // Kết thúc 1 câu lệnh
       }
-      else
+      else if (rx_data != ' ')
       {
-        queue_full_flag = 1;         // Hàng đợi đầy
+        is_receiving_cmd = 1; // Đang ở giữa câu lệnh (ví dụ đang gõ "X" nên nếu gặp số '0' tiếp theo trong "X0Y3" sẽ không bị dừng)
+      }
+
+      // Đẩy byte thô vào bộ đệm vòng cho while(1) tự xử lý
+      uint8_t next_raw_head = (raw_head + 1) % RAW_FIFO_SIZE;
+      if (next_raw_head != raw_tail)
+      {
+        raw_rx_fifo[raw_head] = rx_data;
+        raw_head = next_raw_head;
       }
     }
 
@@ -460,11 +609,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
       pulse_state_Y = 0;
       HAL_TIM_Base_Stop_IT(&htim2);
       is_motor_busy = 0; // Báo rảnh để while(1) tự rút lệnh tiếp theo trong FIFO ra chạy
+      cmd_done_flag = 1; // Bật cờ báo cho while(1) in thông báo đã chạy xong
     }
   }
 }
 
 /* USER CODE END 4 */
+
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None

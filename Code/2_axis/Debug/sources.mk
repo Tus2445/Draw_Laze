@@ -26,4 +26,5 @@ SUBDIRS := \
 Core/Src \
 Core/Startup \
 Drivers/STM32F1xx_HAL_Driver/Src \
+Drivers/CMSIS/Device/ST/STM32F1xx/Source/Templates \
 
