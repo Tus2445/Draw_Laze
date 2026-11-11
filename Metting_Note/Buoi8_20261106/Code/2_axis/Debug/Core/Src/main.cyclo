@@ -1,0 +1,11 @@
+../Core/Src/main.c:120:6:UART_SendString	1
+../Core/Src/main.c:126:6:Emergency_Stop_ISR	1
+../Core/Src/main.c:153:6:Parse_And_Push_Command	14
+../Core/Src/main.c:224:5:main	35
+../Core/Src/main.c:529:6:SystemClock_Config	3
+../Core/Src/main.c:569:13:MX_TIM2_Init	4
+../Core/Src/main.c:614:13:MX_USART1_UART_Init	2
+../Core/Src/main.c:647:13:MX_GPIO_Init	1
+../Core/Src/main.c:683:6:HAL_UART_RxCpltCallback	9
+../Core/Src/main.c:719:6:HAL_TIM_PeriodElapsedCallback	27
+../Core/Src/main.c:859:6:Error_Handler	1
