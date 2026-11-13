@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Deque, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QFont, QIntValidator, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -127,6 +128,9 @@ class TapSenderWorker(QThread):
         strict_ack: bool = True,
         ack_value: str = "ok",
         wait_on_timeout: bool = False,
+        infinite_timeout: bool = False,
+        queue_size: int = 1,
+        inter_cmd_delay_ms: int = 0,
     ):
         super().__init__()
         self.serial_mgr = serial_mgr
@@ -139,6 +143,9 @@ class TapSenderWorker(QThread):
         self.strict_ack = strict_ack
         self.ack_value = (ack_value or "ok").strip() or "ok"
         self.wait_on_timeout = wait_on_timeout
+        self.infinite_timeout = bool(infinite_timeout)
+        self.queue_size = max(1, int(queue_size))
+        self.inter_cmd_delay_ms = max(0, int(inter_cmd_delay_ms))
 
         self._rx_queue: "queue.Queue[str]" = queue.Queue()
         self._stop_event = threading.Event()
@@ -181,12 +188,16 @@ class TapSenderWorker(QThread):
         self._pause_event.set()
 
     def _sleep_interruptible(self, duration: float) -> bool:
+        if duration <= 0:
+            return not self._stop_event.is_set()
         end_time = time.monotonic() + duration
-        while time.monotonic() < end_time:
+        while True:
             if self._stop_event.is_set():
                 return False
-            time.sleep(0.05)
-        return True
+            remaining = end_time - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.002, remaining))
 
     def run(self) -> None:
         total_cmds = len(self.commands)
@@ -219,7 +230,17 @@ class TapSenderWorker(QThread):
             except queue.Empty:
                 break
 
-        for idx, item in enumerate(self.commands, 1):
+        if self.queue_size > 1:
+            self.log_event.emit(
+                "INFO",
+                f"Chế độ gửi theo hàng đợi: Gửi liên tục tối đa {self.queue_size} lệnh "
+                f"(độ trễ giữa các lệnh: {self.inter_cmd_delay_ms} ms) mới chờ 1 phản hồi '{self.ack_value}'.",
+            )
+
+        inter_delay_sec = self.inter_cmd_delay_ms / 1000.0
+        batch_start = 0
+
+        while batch_start < total_cmds:
             if self._stop_event.is_set():
                 self.status_changed.emit("Stopped")
                 self.transmission_finished.emit(
@@ -245,43 +266,92 @@ class TapSenderWorker(QThread):
                 )
                 return
 
+            batch = self.commands[batch_start : batch_start + self.queue_size]
+            batch_len = len(batch)
+            first_idx = batch_start + 1
+            last_idx = batch_start + batch_len
+
             self.status_changed.emit("Sending")
-            self.progress_updated.emit(ack_count, idx, total_cmds, item.cleaned_command)
-
-            payload = (item.cleaned_command + "\n").encode("ascii", errors="replace")
             self._waiting_for_ack = True
-            if not self.serial_mgr.write_bytes(payload, source="TAP"):
-                self._waiting_for_ack = False
-                self.status_changed.emit("Error")
-                self.command_result.emit(
-                    item.line_number, item.cleaned_command, False, "", "SEND_FAILED"
-                )
-                self.transmission_finished.emit(
-                    False,
-                    f"Lỗi gửi lệnh tại dòng {item.line_number}: {item.cleaned_command}",
-                )
-                return
 
-            self.log_event.emit(
-                "TX",
-                f"[Lệnh {idx}/{total_cmds} | Dòng {item.line_number}/{self.total_file_lines}] "
-                f"Gửi: {item.cleaned_command}",
-            )
+            # Gửi liên tục toàn bộ các lệnh trong lô (hàng đợi) hiện tại
+            for offset, item in enumerate(batch):
+                curr_idx = batch_start + offset + 1
+                if self._stop_event.is_set():
+                    self._waiting_for_ack = False
+                    self.status_changed.emit("Stopped")
+                    self.transmission_finished.emit(
+                        False,
+                        f"Đã dừng bởi người dùng ({ack_count}/{total_cmds} lệnh hoàn tất).",
+                    )
+                    return
 
+                self.progress_updated.emit(
+                    ack_count, curr_idx, total_cmds, item.cleaned_command
+                )
+
+                payload = (item.cleaned_command + "\n").encode("ascii", errors="replace")
+                if not self.serial_mgr.write_bytes(payload, source="TAP"):
+                    self._waiting_for_ack = False
+                    self.status_changed.emit("Error")
+                    self.command_result.emit(
+                        item.line_number, item.cleaned_command, False, "", "SEND_FAILED"
+                    )
+                    self.transmission_finished.emit(
+                        False,
+                        f"Lỗi gửi lệnh tại dòng {item.line_number}: {item.cleaned_command}",
+                    )
+                    return
+
+                if self.queue_size > 1:
+                    self.log_event.emit(
+                        "TX",
+                        f"[Lô {first_idx}..{last_idx} ({offset + 1}/{batch_len}) | "
+                        f"Lệnh {curr_idx}/{total_cmds} | Dòng {item.line_number}/{self.total_file_lines}] "
+                        f"Gửi: {item.cleaned_command}",
+                    )
+                else:
+                    self.log_event.emit(
+                        "TX",
+                        f"[Lệnh {curr_idx}/{total_cmds} | Dòng {item.line_number}/{self.total_file_lines}] "
+                        f"Gửi: {item.cleaned_command}",
+                    )
+
+                # Tạo độ trễ nhỏ (ms) giữa các lệnh trong cùng một lô để tránh tràn RX buffer trên STM32
+                if offset < batch_len - 1 and inter_delay_sec > 0:
+                    if not self._sleep_interruptible(inter_delay_sec):
+                        self._waiting_for_ack = False
+                        self.status_changed.emit("Stopped")
+                        self.transmission_finished.emit(
+                            False,
+                            f"Đã dừng bởi người dùng ({ack_count}/{total_cmds} lệnh hoàn tất).",
+                        )
+                        return
+
+            # Sau khi đã gửi đủ N lệnh (hoặc các lệnh cuối cùng của file), chờ 1 ACK duy nhất
             if self._pause_event.is_set():
                 self.status_changed.emit("Waiting for Response")
+
             start_wait = time.monotonic()
             deadline = start_wait + self.command_timeout
             max_deadline = start_wait + (self.command_timeout * 1.5)
-            cmd_acknowledged = False
+            batch_acknowledged = False
+
+            last_item = batch[-1]
+            batch_desc = (
+                f"lệnh #{first_idx} ({last_item.cleaned_command})"
+                if batch_len == 1
+                else f"lô lệnh #{first_idx}..#{last_idx} ({batch_len} lệnh, cuối: {last_item.cleaned_command})"
+            )
 
             while True:
                 if self._stop_event.is_set():
                     self._waiting_for_ack = False
                     self.status_changed.emit("Stopped")
-                    self.command_result.emit(
-                        item.line_number, item.cleaned_command, True, "", "STOPPED"
-                    )
+                    for it in batch:
+                        self.command_result.emit(
+                            it.line_number, it.cleaned_command, True, "", "STOPPED"
+                        )
                     self.transmission_finished.emit(
                         False, "Đã dừng gửi lệnh theo yêu cầu người dùng."
                     )
@@ -290,15 +360,16 @@ class TapSenderWorker(QThread):
                 if not self.serial_mgr.is_connected:
                     self._waiting_for_ack = False
                     self.status_changed.emit("Error")
-                    self.command_result.emit(
-                        item.line_number, item.cleaned_command, True, "", "DISCONNECTED"
-                    )
+                    for it in batch:
+                        self.command_result.emit(
+                            it.line_number, it.cleaned_command, True, "", "DISCONNECTED"
+                        )
                     self.transmission_finished.emit(
                         False, "Thiết bị ngắt kết nối khi đang chờ phản hồi."
                     )
                     return
 
-                # Nếu người dùng đang bấm Tạm dừng ngay khi lệnh hiện tại chưa nhận xong ACK,
+                # Nếu người dùng đang bấm Tạm dừng ngay khi lô lệnh hiện tại chưa nhận xong ACK,
                 # tạm dừng tính thời gian Timeout cho đến khi bấm Tiếp tục hoặc nhận được ACK.
                 if not self._pause_event.is_set() and self._rx_queue.empty():
                     pause_tick = time.monotonic()
@@ -310,12 +381,15 @@ class TapSenderWorker(QThread):
                     continue
 
                 now = time.monotonic()
-                if now >= deadline:
+                no_timeout_active = self.infinite_timeout or bool(
+                    getattr(self.serial_mgr, "no_timeout", False)
+                )
+                if not no_timeout_active and now >= deadline:
                     if self.wait_on_timeout:
                         elapsed_wait = now - start_wait
                         self.log_event.emit(
                             "WARN",
-                            f"Đã chờ {elapsed_wait:.1f}s cho lệnh #{idx} ({item.cleaned_command}) "
+                            f"Đã chờ {elapsed_wait:.1f}s cho {batch_desc} "
                             f"— Vẫn đang tiếp tục chờ phản hồi '{self.ack_value}'...",
                         )
                         deadline = now + self.command_timeout
@@ -332,15 +406,23 @@ class TapSenderWorker(QThread):
                     response, ack_value=self.ack_value, strict_ack=self.strict_ack
                 )
                 if category == "ok":
-                    ack_count += 1
-                    cmd_acknowledged = True
+                    ack_count += batch_len
+                    batch_acknowledged = True
                     self._waiting_for_ack = False
-                    self.log_event.emit("OK", f"Phản hồi: {response}")
-                    self.command_result.emit(
-                        item.line_number, item.cleaned_command, True, response, "OK"
-                    )
+                    if batch_len > 1:
+                        self.log_event.emit(
+                            "OK",
+                            f"Phản hồi cho lô #{first_idx}..#{last_idx} ({batch_len} lệnh): {response}",
+                        )
+                    else:
+                        self.log_event.emit("OK", f"Phản hồi: {response}")
+
+                    for it in batch:
+                        self.command_result.emit(
+                            it.line_number, it.cleaned_command, True, response, "OK"
+                        )
                     self.progress_updated.emit(
-                        ack_count, idx, total_cmds, item.cleaned_command
+                        ack_count, last_idx, total_cmds, last_item.cleaned_command
                     )
                     break
                 elif category in ("error", "alarm"):
@@ -349,48 +431,44 @@ class TapSenderWorker(QThread):
                     self.log_event.emit(
                         "ERR", f"Cảnh báo/Lỗi từ thiết bị: {response}"
                     )
-                    if self.stop_on_error:
-                        self.status_changed.emit("Error")
+                    for it in batch:
                         self.command_result.emit(
-                            item.line_number,
-                            item.cleaned_command,
+                            it.line_number,
+                            it.cleaned_command,
                             True,
                             response,
                             category.upper(),
                         )
+                    if self.stop_on_error:
+                        self.status_changed.emit("Error")
                         self.transmission_finished.emit(
                             False,
-                            f"Dừng truyền do thiết bị báo lỗi tại lệnh #{idx} ({item.cleaned_command}): {response}",
+                            f"Dừng truyền do thiết bị báo lỗi tại {batch_desc}: {response}",
                         )
                         return
                     else:
-                        cmd_acknowledged = True
-                        self.command_result.emit(
-                            item.line_number,
-                            item.cleaned_command,
-                            True,
-                            response,
-                            category.upper(),
-                        )
+                        batch_acknowledged = True
                         break
                 else:
                     self.log_event.emit("RX", f"Thiết bị: {response}")
                     if self.wait_on_timeout:
                         deadline = max(deadline, time.monotonic() + 0.5)
                     else:
-                        deadline = min(max_deadline, max(deadline, time.monotonic() + 0.5))
+                        deadline = min(
+                            max_deadline, max(deadline, time.monotonic() + 0.5)
+                        )
 
             self._waiting_for_ack = False
-            if not cmd_acknowledged:
+            if not batch_acknowledged:
                 error_count += 1
                 timeout_msg = (
-                    f"Quá thời gian chờ ({self.command_timeout:.1f}s) cho lệnh #{idx}: "
-                    f"{item.cleaned_command}"
+                    f"Quá thời gian chờ ({self.command_timeout:.1f}s) cho {batch_desc}"
                 )
                 self.log_event.emit("ERR", timeout_msg)
-                self.command_result.emit(
-                    item.line_number, item.cleaned_command, True, "", "TIMEOUT"
-                )
+                for it in batch:
+                    self.command_result.emit(
+                        it.line_number, it.cleaned_command, True, "", "TIMEOUT"
+                    )
                 if self.stop_on_timeout:
                     self.status_changed.emit("Error")
                     self.transmission_finished.emit(False, timeout_msg)
@@ -398,8 +476,10 @@ class TapSenderWorker(QThread):
                 else:
                     self.log_event.emit(
                         "WARN",
-                        "Tiếp tục gửi lệnh kế tiếp theo cấu hình bỏ qua Timeout.",
+                        "Tiếp tục gửi lô lệnh kế tiếp theo cấu hình bỏ qua Timeout.",
                     )
+
+            batch_start += batch_len
 
         if error_count == 0 and ack_count == total_cmds:
             self.status_changed.emit("Completed")
@@ -461,7 +541,7 @@ class TapPreviewDialog(QDialog):
 
 
 class TapFileSenderTab(QWidget):
-    """Giao diện Tab 1: Chọn file .tap, xem trước, điều khiển gửi và theo dõi tiến độ."""
+    """Giao diện Tab 1: Chọn file .tap, xem trước, chọn xung laze, điều khiển gửi và theo dõi tiến độ."""
 
     request_auto_connect = Signal()
     transmission_state_changed = Signal(bool)  # True khi đang truyền tích cực, False khi dừng/tạm dừng
@@ -487,6 +567,15 @@ class TapFileSenderTab(QWidget):
         )
         self._export_worker: Optional[LogExportWorker] = None
 
+        # Trạng thái chọn và xác nhận (ACK) loại xung laze
+        self._waiting_laser_ack: bool = False
+        self._laser_ack_received: bool = False
+        self._pending_laser_cmd: str = ""
+        self._confirmed_laser_cmd: str = ""
+
+        self._no_timeout_mode: bool = False
+        self._saved_timeout_policy_idx: int = 0
+
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(200)
         self._elapsed_timer.timeout.connect(self._update_elapsed_time)
@@ -495,10 +584,18 @@ class TapFileSenderTab(QWidget):
 
         if settings:
             self.ack_value_edit.setText(settings.ack_value())
+            if hasattr(settings, "queue_size"):
+                self.queue_size_edit.setText(str(settings.queue_size(1)))
+            if hasattr(settings, "inter_cmd_delay_ms"):
+                self.inter_cmd_delay_spin.setValue(settings.inter_cmd_delay_ms(5))
         self.ack_value_edit.textChanged.connect(self._on_ack_value_changed)
+        self.queue_size_edit.textChanged.connect(self._on_queue_size_changed)
+        self.queue_size_edit.editingFinished.connect(self._normalize_queue_size_input)
+        self.inter_cmd_delay_spin.valueChanged.connect(self._on_inter_cmd_delay_changed)
 
-        # Luôn lắng nghe tín hiệu UART ngoài gửi tới, kể cả khi không truyền file
+        # Luôn lắng nghe tín hiệu UART ngoài gửi tới và trạng thái kết nối
         self.serial_mgr.line_received.connect(self._on_external_signal_received)
+        self.serial_mgr.connection_changed.connect(self._on_serial_connection_changed)
 
     @property
     def is_transmitting(self) -> bool:
@@ -553,6 +650,41 @@ class TapFileSenderTab(QWidget):
         file_layout.addWidget(self.file_info_label, 1, 0, 1, 4)
         file_layout.setColumnStretch(1, 1)
         main_layout.addWidget(file_group)
+
+        # Khu vực Chọn Loại Xung Laze (Nằm ngay trên mục 2. Điều khiển Truyền)
+        laser_group = QGroupBox("Chọn Loại Xung Laze")
+        laser_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        laser_layout = QHBoxLayout(laser_group)
+        laser_layout.setContentsMargins(10, 10, 10, 8)
+        laser_layout.setSpacing(10)
+
+        lbl_laser = QLabel("Chọn loại xung laze:")
+        self.laser_type_combo = QComboBox()
+        self.laser_type_combo.setFixedHeight(28)
+        self.laser_type_combo.setMinimumWidth(160)
+        self.laser_type_combo.addItem("Loại 1", "Laze1")
+        self.laser_type_combo.addItem("Loại 2", "Laze2")
+        self.laser_type_combo.currentIndexChanged.connect(self._on_laser_type_changed)
+
+        self.send_laser_btn = QPushButton("Gửi yêu cầu")
+        self.send_laser_btn.setFixedHeight(28)
+        self.send_laser_btn.setMinimumWidth(130)
+        self.send_laser_btn.setStyleSheet(
+            "QPushButton { background-color: #0d6efd; color: white; font-weight: bold; padding: 4px 12px; border-radius: 4px; }"
+            "QPushButton:disabled { background-color: #9ec5fe; color: #ffffff; }"
+        )
+        self.send_laser_btn.clicked.connect(self._on_send_laser_request)
+
+        self.laser_status_lbl = QLabel("● Chưa chọn / gửi yêu cầu xung laze")
+        self.laser_status_lbl.setStyleSheet("color: #6c757d; font-weight: bold;")
+
+        laser_layout.addWidget(lbl_laser)
+        laser_layout.addWidget(self.laser_type_combo)
+        laser_layout.addWidget(self.send_laser_btn)
+        laser_layout.addSpacing(10)
+        laser_layout.addWidget(self.laser_status_lbl)
+        laser_layout.addStretch()
+        main_layout.addWidget(laser_group)
 
         # 2. Khu vực điều khiển truyền và cấu hình giao thức
         ctrl_group = QGroupBox("2. Điều khiển Truyền && Tùy chọn Phản hồi")
@@ -621,18 +753,34 @@ class TapFileSenderTab(QWidget):
         self.boot_delay_chk.setMinimumHeight(24)
         self.boot_delay_chk.setChecked(True)
 
-        opts_grid.addWidget(self.auto_connect_chk, 0, 0, 1, 2)
-        opts_grid.addWidget(self.boot_delay_chk, 0, 2, 1, 2)
+        lbl_inter_delay = QLabel("Độ trễ giữa các lệnh trong lô (ms):")
+        self.inter_cmd_delay_spin = QSpinBox()
+        self.inter_cmd_delay_spin.setRange(0, 5000)
+        self.inter_cmd_delay_spin.setSingleStep(1)
+        self.inter_cmd_delay_spin.setValue(5)
+        self.inter_cmd_delay_spin.setFixedHeight(28)
+        self.inter_cmd_delay_spin.setSuffix(" ms")
+        self.inter_cmd_delay_spin.setToolTip(
+            "Khoảng nghỉ nhỏ (mili-giây) giữa các lệnh gửi liên tiếp trong cùng một hàng đợi "
+            "để tránh tràn bộ đệm UART RX trên vi điều khiển (STM32)."
+        )
+
+        opts_grid.addWidget(self.auto_connect_chk, 0, 0)
+        opts_grid.addWidget(self.boot_delay_chk, 0, 1)
+        opts_grid.addWidget(lbl_inter_delay, 0, 2)
+        opts_grid.addWidget(self.inter_cmd_delay_spin, 0, 3)
 
         lbl_timeout_pol = QLabel("Khi hết Timeout:")
         self.timeout_policy_combo = QComboBox()
         self.timeout_policy_combo.setFixedHeight(28)
-        self.timeout_policy_combo.addItems(
-            [
-                "Tiếp tục chờ phản hồi",
-                "Dừng truyền ngay (An toàn)",
-                "Bỏ qua & gửi lệnh tiếp",
-            ]
+        self._normal_timeout_policies = [
+            "Tiếp tục chờ phản hồi",
+            "Dừng truyền ngay (An toàn)",
+            "Bỏ qua & gửi lệnh tiếp",
+        ]
+        self.timeout_policy_combo.addItems(self._normal_timeout_policies)
+        self.timeout_policy_combo.currentIndexChanged.connect(
+            self._on_timeout_policy_combo_changed
         )
 
         lbl_err_pol = QLabel("Khi nhận 'error'/'alarm':")
@@ -657,8 +805,28 @@ class TapFileSenderTab(QWidget):
             "Chuỗi tín hiệu UART ngoài gửi về được xem là xác nhận hoàn tất lệnh "
             "(mặc định là 'ok', có thể đổi thành bất kỳ giá trị nào)"
         )
+
+        lbl_queue_size = QLabel("Số lượng hàng đợi UART (lệnh/1 ACK):")
+        self.queue_size_edit = QLineEdit("1")
+        self.queue_size_edit.setFixedHeight(28)
+        self.queue_size_edit.setValidator(QIntValidator(1, 1000, self.queue_size_edit))
+        self.queue_size_edit.setPlaceholderText("1..1000")
+        self.queue_size_edit.setToolTip(
+            "Số lệnh gửi liên tiếp qua UART trước khi dừng lại chờ 1 phản hồi ACK "
+            "(1 = gửi từng lệnh một; N > 1 = gửi liên tục N lệnh rồi chờ 1 ACK)."
+        )
+        lbl_queue_unit = QLabel("lệnh")
+
+        queue_size_box_row = QHBoxLayout()
+        queue_size_box_row.setContentsMargins(0, 0, 0, 0)
+        queue_size_box_row.setSpacing(6)
+        queue_size_box_row.addWidget(self.queue_size_edit, stretch=1)
+        queue_size_box_row.addWidget(lbl_queue_unit)
+
         opts_grid.addWidget(lbl_ack_value, 2, 0)
-        opts_grid.addWidget(self.ack_value_edit, 2, 1, 1, 3)
+        opts_grid.addWidget(self.ack_value_edit, 2, 1)
+        opts_grid.addWidget(lbl_queue_size, 2, 2)
+        opts_grid.addLayout(queue_size_box_row, 2, 3)
 
         ctrl_layout.addLayout(opts_grid)
         main_layout.addWidget(ctrl_group)
@@ -771,13 +939,124 @@ class TapFileSenderTab(QWidget):
         scroll_area.setWidget(content_widget)
         outer_layout.addWidget(scroll_area)
 
+    def _on_timeout_policy_combo_changed(self, index: int) -> None:
+        if not self._no_timeout_mode and 0 <= index < len(self._normal_timeout_policies):
+            self._saved_timeout_policy_idx = index
+
+    def set_no_timeout_mode(self, no_timeout: bool) -> None:
+        """Khóa ô 'Khi hết Timeout' và hiển thị trạng thái đang ở chế độ Không Timeout."""
+        no_timeout = bool(no_timeout)
+        if no_timeout == self._no_timeout_mode:
+            self.timeout_policy_combo.setEnabled(
+                (not self.is_transmitting) and (not self._no_timeout_mode)
+            )
+            return
+
+        self._no_timeout_mode = no_timeout
+        self.timeout_policy_combo.blockSignals(True)
+        if no_timeout:
+            curr = self.timeout_policy_combo.currentIndex()
+            if 0 <= curr < len(self._normal_timeout_policies):
+                self._saved_timeout_policy_idx = curr
+            self.timeout_policy_combo.clear()
+            self.timeout_policy_combo.addItem("Đang ở chế độ Không Timeout (Chờ vô hạn)")
+            self.timeout_policy_combo.setCurrentIndex(0)
+            self.timeout_policy_combo.setEnabled(False)
+        else:
+            self.timeout_policy_combo.clear()
+            self.timeout_policy_combo.addItems(self._normal_timeout_policies)
+            restore_idx = (
+                self._saved_timeout_policy_idx
+                if 0 <= self._saved_timeout_policy_idx < len(self._normal_timeout_policies)
+                else 0
+            )
+            self.timeout_policy_combo.setCurrentIndex(restore_idx)
+            self.timeout_policy_combo.setEnabled(not self.is_transmitting)
+        self.timeout_policy_combo.blockSignals(False)
+
     def _set_options_enabled(self, enabled: bool) -> None:
         """Khóa/mở các tùy chọn cấu hình giao thức trong khi đang truyền file."""
         self.auto_connect_chk.setEnabled(enabled)
         self.boot_delay_chk.setEnabled(enabled)
-        self.timeout_policy_combo.setEnabled(enabled)
+        self.timeout_policy_combo.setEnabled(enabled and (not self._no_timeout_mode))
         self.error_policy_combo.setEnabled(enabled)
         self.ack_value_edit.setEnabled(enabled)
+        self.queue_size_edit.setEnabled(enabled)
+        self.inter_cmd_delay_spin.setEnabled(enabled)
+        self.laser_type_combo.setEnabled(enabled)
+        self.send_laser_btn.setEnabled(enabled)
+
+    def _on_laser_type_changed(self, _index: int) -> None:
+        current_cmd = self.laser_type_combo.currentData()
+        if self._confirmed_laser_cmd == current_cmd and current_cmd:
+            self._laser_ack_received = True
+            self._waiting_laser_ack = False
+            ack_val = self.ack_value_edit.text().strip() or "ok"
+            self.laser_status_lbl.setText(
+                f"● Đã xác nhận {current_cmd} (ACK: '{ack_val}')"
+            )
+            self.laser_status_lbl.setStyleSheet("color: #198754; font-weight: bold;")
+        else:
+            self._laser_ack_received = False
+            self._waiting_laser_ack = False
+            self.laser_status_lbl.setText(
+                f"● Đã đổi sang {self.laser_type_combo.currentText()} ({current_cmd}) — Chưa gửi yêu cầu"
+            )
+            self.laser_status_lbl.setStyleSheet("color: #6c757d; font-weight: bold;")
+
+    def _on_send_laser_request(self) -> None:
+        if self.is_transmitting:
+            QMessageBox.warning(
+                self,
+                "Đang truyền file",
+                "Không thể gửi yêu cầu chọn xung laze khi đang truyền file .tap.",
+            )
+            return
+
+        if not self.serial_mgr.is_connected:
+            if self.auto_connect_chk.isChecked():
+                self.request_auto_connect.emit()
+            if not self.serial_mgr.is_connected:
+                QMessageBox.warning(
+                    self,
+                    "Chưa kết nối UART",
+                    "Vui lòng kết nối cổng COM trước khi gửi yêu cầu xung laze.",
+                )
+                return
+
+        laser_cmd = self.laser_type_combo.currentData() or "Laze1"
+        payload = (laser_cmd + "\n").encode("ascii", errors="replace")
+
+        self._laser_ack_received = False
+        self._confirmed_laser_cmd = ""
+        self._pending_laser_cmd = laser_cmd
+        self._waiting_laser_ack = True
+
+        if not self.serial_mgr.write_bytes(payload, source="TAP"):
+            self._waiting_laser_ack = False
+            self.laser_status_lbl.setText(f"● Lỗi gửi yêu cầu {laser_cmd}")
+            self.laser_status_lbl.setStyleSheet("color: #dc3545; font-weight: bold;")
+            self._append_log("ERR", f"Không thể gửi yêu cầu xung laze: {laser_cmd}")
+            return
+
+        ack_val = self.ack_value_edit.text().strip() or "ok"
+        self.laser_status_lbl.setText(
+            f"● Đã gửi '{laser_cmd}', đang chờ phản hồi ACK ('{ack_val}')..."
+        )
+        self.laser_status_lbl.setStyleSheet("color: #fd7e14; font-weight: bold;")
+        self._append_log(
+            "TX",
+            f"Gửi yêu cầu chọn xung laze: {laser_cmd} (Chờ ACK: '{ack_val}')",
+        )
+
+    def _on_serial_connection_changed(self, is_connected: bool, _msg: str) -> None:
+        if not is_connected:
+            self._waiting_laser_ack = False
+            self._laser_ack_received = False
+            self._pending_laser_cmd = ""
+            self._confirmed_laser_cmd = ""
+            self.laser_status_lbl.setText("● Chưa chọn / gửi yêu cầu xung laze")
+            self.laser_status_lbl.setStyleSheet("color: #6c757d; font-weight: bold;")
 
     def _on_browse_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -867,12 +1146,51 @@ class TapFileSenderTab(QWidget):
                 self._set_status("Idle")
                 return
 
-        timeout_policy_idx = self.timeout_policy_combo.currentIndex()
+        # Kiểm tra xem đã chọn và nhận được phản hồi ACK cho loại xung laze hay chưa
+        if not self._laser_ack_received:
+            ack_val = self.ack_value_edit.text().strip() or "ok"
+            if self._waiting_laser_ack:
+                warn_text = (
+                    f"Đã gửi yêu cầu xung laze ({self._pending_laser_cmd}) nhưng CHƯA nhận được "
+                    f"phản hồi xác nhận (ACK: '{ack_val}').\n\n"
+                    "Bạn có muốn tiếp tục gửi file khi chưa chọn / xác nhận xung laze hay không?"
+                )
+            else:
+                warn_text = (
+                    "Bạn chưa gửi yêu cầu chọn loại xung laze (hoặc chưa nhận phản hồi xác nhận ACK).\n\n"
+                    "Bạn có muốn gửi file khi chưa chọn xung laze hay không?"
+                )
+
+            ans = QMessageBox.question(
+                self,
+                "Chưa xác nhận xung laze",
+                warn_text,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                self._set_status("Idle")
+                return
+
+            # Hủy trạng thái chờ ACK xung laze để không bắt nhầm ACK của lệnh G-code đầu tiên
+            self._waiting_laser_ack = False
+            self._append_log(
+                "WARN",
+                "Người dùng chọn tiếp tục truyền file .tap khi chưa xác nhận xung laze.",
+            )
+
+        timeout_policy_idx = (
+            self._saved_timeout_policy_idx
+            if self._no_timeout_mode
+            else self.timeout_policy_combo.currentIndex()
+        )
         wait_on_timeout = timeout_policy_idx == 0
         stop_on_timeout = timeout_policy_idx == 1
         stop_on_error = self.error_policy_combo.currentIndex() == 0
         boot_delay = 2.0 if self.boot_delay_chk.isChecked() else 0.0
         ack_value = self.ack_value_edit.text().strip() or "ok"
+        queue_size = self._get_queue_size_value()
+        inter_cmd_delay_ms = self.inter_cmd_delay_spin.value()
 
         self.worker = TapSenderWorker(
             serial_mgr=self.serial_mgr,
@@ -885,6 +1203,9 @@ class TapFileSenderTab(QWidget):
             strict_ack=True,
             ack_value=ack_value,
             wait_on_timeout=wait_on_timeout,
+            infinite_timeout=bool(getattr(self.serial_mgr, "no_timeout", False)),
+            queue_size=queue_size,
+            inter_cmd_delay_ms=inter_cmd_delay_ms,
         )
 
         self.serial_mgr.line_received.connect(self.worker.on_line_received)
@@ -997,6 +1318,34 @@ class TapFileSenderTab(QWidget):
         clean_ack = text.strip() or "ok"
         if self.settings:
             self.settings.set_ack_value(clean_ack)
+
+    def _get_queue_size_value(self) -> int:
+        text = self.queue_size_edit.text().strip()
+        try:
+            val = int(text)
+        except ValueError:
+            val = 1
+        return max(1, min(1000, val))
+
+    def _normalize_queue_size_input(self) -> None:
+        val = self._get_queue_size_value()
+        if self.queue_size_edit.text().strip() != str(val):
+            self.queue_size_edit.setText(str(val))
+
+    def _on_queue_size_changed(self, text: str) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        try:
+            val = max(1, min(1000, int(clean)))
+        except ValueError:
+            return
+        if self.settings and hasattr(self.settings, "set_queue_size"):
+            self.settings.set_queue_size(val)
+
+    def _on_inter_cmd_delay_changed(self, value: int) -> None:
+        if self.settings and hasattr(self.settings, "set_inter_cmd_delay_ms"):
+            self.settings.set_inter_cmd_delay_ms(value)
 
     def _on_command_result(
         self,
@@ -1121,3 +1470,35 @@ class TapFileSenderTab(QWidget):
         cursor.insertText(f"[{ts}] {line}\n")
         self.rx_signal_log.setTextCursor(cursor)
         self.rx_signal_log.ensureCursorVisible()
+
+        # Kiểm tra phản hồi ACK nếu đang chờ xác nhận lệnh chọn loại xung laze
+        if self._waiting_laser_ack and not self.is_transmitting:
+            ack_val = self.ack_value_edit.text().strip() or "ok"
+            category = classify_response(line, ack_value=ack_val, strict_ack=True)
+            if category == "ok":
+                self._waiting_laser_ack = False
+                self._laser_ack_received = True
+                self._confirmed_laser_cmd = self._pending_laser_cmd
+                self.laser_status_lbl.setText(
+                    f"● Đã xác nhận {self._confirmed_laser_cmd} (ACK: '{line}')"
+                )
+                self.laser_status_lbl.setStyleSheet(
+                    "color: #198754; font-weight: bold;"
+                )
+                self._append_log(
+                    "OK",
+                    f"Thiết bị đã xác nhận xung laze '{self._confirmed_laser_cmd}' (Phản hồi: {line}). Sẵn sàng gửi file.",
+                )
+            elif category in ("error", "alarm"):
+                self._waiting_laser_ack = False
+                self._laser_ack_received = False
+                self.laser_status_lbl.setText(
+                    f"● Thiết bị báo lỗi khi chọn {self._pending_laser_cmd}: {line}"
+                )
+                self.laser_status_lbl.setStyleSheet(
+                    "color: #dc3545; font-weight: bold;"
+                )
+                self._append_log(
+                    "ERR",
+                    f"Thiết bị từ chối/báo lỗi khi chọn xung laze '{self._pending_laser_cmd}': {line}",
+                )

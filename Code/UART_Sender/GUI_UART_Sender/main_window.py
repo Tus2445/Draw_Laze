@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from app_settings import AppSettings
+from config_tab import ConfigTab
 from serial_manager import (
     COMMON_BAUDRATES,
     DEFAULT_BAUDRATE,
@@ -76,7 +77,7 @@ class MainWindow(QMainWindow):
         tb_grid.setHorizontalSpacing(12)
         tb_grid.setVerticalSpacing(8)
 
-        # Hàng 1: Chọn Cổng COM, Làm mới, Baudrate, Timeout (7 cột: 0..6)
+        # Hàng 1: Chọn Cổng COM, Làm mới, Baudrate, Timeout, Không chờ Timeout (8 cột: 0..7)
         lbl_port = QLabel("<b>Cổng COM:</b>")
         self.port_combo = QComboBox()
         self.port_combo.setMinimumHeight(28)
@@ -105,10 +106,16 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setMinimumHeight(28)
         self.timeout_spin.setMinimumWidth(85)
         self.timeout_spin.setToolTip(
-            "Thời gian chờ tối đa cho phản hồi 'ok' của mỗi lệnh .tap"
+            "Thời gian chờ tối đa cho phản hồi của mỗi lệnh (Tab Config & Tab TAP File Sender)"
         )
-        self.timeout_spin.valueChanged.connect(self.serial_mgr.set_timeout)
-        self.timeout_spin.valueChanged.connect(self.settings.set_last_timeout)
+        self.timeout_spin.valueChanged.connect(self._on_timeout_spin_changed)
+
+        self.no_timeout_chk = QCheckBox("Không chờ Timeout (Vô hạn)")
+        self.no_timeout_chk.setMinimumHeight(28)
+        self.no_timeout_chk.setToolTip(
+            "Khi bật: Hệ thống sẽ chờ phản hồi vô hạn (không báo lỗi quá thời gian chờ Timeout)."
+        )
+        self.no_timeout_chk.toggled.connect(self._on_no_timeout_toggled)
 
         tb_grid.addWidget(lbl_port, 0, 0)
         tb_grid.addWidget(self.port_combo, 0, 1)
@@ -117,6 +124,7 @@ class MainWindow(QMainWindow):
         tb_grid.addWidget(self.baud_combo, 0, 4)
         tb_grid.addWidget(lbl_timeout, 0, 5)
         tb_grid.addWidget(self.timeout_spin, 0, 6)
+        tb_grid.addWidget(self.no_timeout_chk, 0, 7)
         tb_grid.setColumnStretch(1, 1)
 
         # Hàng 2: Nút Kết nối, Ngắt kết nối, Chế độ mô phỏng và Nhãn trạng thái
@@ -166,7 +174,7 @@ class MainWindow(QMainWindow):
         action_row.addWidget(QLabel("<b>Trạng thái cổng:</b>"))
         action_row.addWidget(self.conn_status_badge)
 
-        tb_grid.addLayout(action_row, 1, 0, 1, 7)
+        tb_grid.addLayout(action_row, 1, 0, 1, 8)
 
         # Hàng 3 (Ẩn mặc định): Khung điều khiển kịch bản lỗi chia 2 dòng rộng rãi
         self.sim_ctrl_frame = QFrame()
@@ -242,12 +250,15 @@ class MainWindow(QMainWindow):
         sim_grid.addLayout(sim_row2, 1, 0)
 
         self.sim_ctrl_frame.setVisible(False)
-        tb_grid.addWidget(self.sim_ctrl_frame, 2, 0, 1, 7)
+        tb_grid.addWidget(self.sim_ctrl_frame, 2, 0, 1, 8)
 
         root_layout.addWidget(toolbar_frame)
 
-        # --- Hai Tab chức năng chính ---
+        # --- Ba Tab chức năng chính ---
         self.tabs = QTabWidget()
+        self.config_tab = ConfigTab(
+            self.serial_mgr, settings=self.settings, parent=self
+        )
         self.tap_tab = TapFileSenderTab(
             self.serial_mgr, settings=self.settings, parent=self
         )
@@ -255,14 +266,18 @@ class MainWindow(QMainWindow):
             self.serial_mgr, settings=self.settings, parent=self
         )
 
-        self.tabs.addTab(self.tap_tab, "Tab 1: TAP File Sender")
-        self.tabs.addTab(self.terminal_tab, "Tab 2: UART Terminal (Hercules)")
+        self.tabs.addTab(self.config_tab, "Tab 1: Config")
+        self.tabs.addTab(self.tap_tab, "Tab 2: TAP File Sender")
+        self.tabs.addTab(self.terminal_tab, "Tab 3: UART Terminal (Hercules)")
         root_layout.addWidget(self.tabs, stretch=1)
 
     def _connect_signals(self) -> None:
         self.serial_mgr.connection_changed.connect(self._on_connection_changed)
         self.serial_mgr.port_error.connect(self._on_port_error)
         self.tap_tab.request_auto_connect.connect(self.on_connect_clicked)
+        self.tap_tab.transmission_state_changed.connect(
+            self.config_tab.set_tap_transmission_active
+        )
         self.tap_tab.transmission_state_changed.connect(
             self.terminal_tab.set_tap_transmission_active
         )
@@ -304,6 +319,18 @@ class MainWindow(QMainWindow):
         except ValueError:
             pass
 
+    def _on_timeout_spin_changed(self, value: float) -> None:
+        self.serial_mgr.set_timeout(value)
+        self.settings.set_last_timeout(value)
+        self.config_tab.on_timeout_config_changed()
+
+    def _on_no_timeout_toggled(self, checked: bool) -> None:
+        self.timeout_spin.setEnabled(not checked)
+        self.serial_mgr.set_no_timeout(checked)
+        self.settings.set_no_timeout(checked)
+        self.config_tab.on_timeout_config_changed()
+        self.tap_tab.set_no_timeout_mode(checked)
+
     def _restore_saved_settings(self) -> None:
         saved_baud = self.settings.last_baudrate(DEFAULT_BAUDRATE)
         self.baud_combo.setCurrentText(str(saved_baud))
@@ -313,6 +340,15 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setValue(saved_timeout)
         self.timeout_spin.blockSignals(False)
         self.serial_mgr.set_timeout(saved_timeout)
+
+        saved_no_timeout = self.settings.no_timeout(False)
+        self.no_timeout_chk.blockSignals(True)
+        self.no_timeout_chk.setChecked(saved_no_timeout)
+        self.no_timeout_chk.blockSignals(False)
+        self.timeout_spin.setEnabled(not saved_no_timeout)
+        self.serial_mgr.set_no_timeout(saved_no_timeout)
+        self.config_tab.on_timeout_config_changed()
+        self.tap_tab.set_no_timeout_mode(saved_no_timeout)
 
         saved_port = self.settings.last_port()
         if saved_port and saved_port in self._known_port_devices:
@@ -488,6 +524,7 @@ class MainWindow(QMainWindow):
             self.tap_tab.force_stop_worker()
 
         self._port_watch_timer.stop()
+        self.config_tab.shutdown()
         self.terminal_tab.shutdown()
         if self.serial_mgr.is_connected:
             self.serial_mgr.disconnect_port("Đóng ứng dụng")

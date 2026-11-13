@@ -153,6 +153,7 @@ class SerialManager(QObject):
         self._port: str = ""
         self._baudrate: int = DEFAULT_BAUDRATE
         self._timeout: float = DEFAULT_TIMEOUT
+        self._no_timeout: bool = False
 
     @property
     def is_connected(self) -> bool:
@@ -169,6 +170,13 @@ class SerialManager(QObject):
     @property
     def current_timeout(self) -> float:
         return self._timeout
+
+    @property
+    def no_timeout(self) -> bool:
+        return self._no_timeout
+
+    def set_no_timeout(self, enabled: bool) -> None:
+        self._no_timeout = bool(enabled)
 
     @property
     def simulated_port(self) -> Optional[SimulatedSerialPort]:

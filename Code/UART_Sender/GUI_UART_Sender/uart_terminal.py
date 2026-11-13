@@ -219,10 +219,6 @@ class UartTerminalTab(QWidget):
         self.hex_view_chk.setMinimumHeight(24)
         self.hex_view_chk.setChecked(False)
 
-        self.show_tap_traffic_chk = QCheckBox("Hiển thị cả dữ liệu khi gửi file .TAP")
-        self.show_tap_traffic_chk.setMinimumHeight(24)
-        self.show_tap_traffic_chk.setChecked(False)
-
         self.export_log_btn = QPushButton("Xuất Log (Export)")
         self.export_log_btn.setMinimumHeight(28)
         self.export_log_btn.setMinimumWidth(160)
@@ -238,9 +234,8 @@ class UartTerminalTab(QWidget):
         view_grid.addWidget(self.timestamp_chk, 0, 1)
         view_grid.addWidget(self.export_log_btn, 0, 2, alignment=Qt.AlignRight)
 
-        # Hàng 1: 2 Checkbox sau + Nút Xóa màn hình bên phải
+        # Hàng 1: Checkbox HEX + Nút Xóa màn hình bên phải
         view_grid.addWidget(self.hex_view_chk, 1, 0)
-        view_grid.addWidget(self.show_tap_traffic_chk, 1, 1)
         view_grid.addWidget(self.clear_btn, 1, 2, alignment=Qt.AlignRight)
 
         view_grid.setColumnStretch(0, 1)
@@ -425,8 +420,6 @@ class UartTerminalTab(QWidget):
             self.input_edit.clear()
 
     def _on_data_sent(self, data: bytes, source: str) -> None:
-        if source == "TAP" and not self.show_tap_traffic_chk.isChecked():
-            return
         display_text = data.decode("latin-1", errors="replace")
         is_hex = self.hex_view_chk.isChecked()
         readable = display_text.replace("\r", "<CR>").replace("\n", "<LF>\n")

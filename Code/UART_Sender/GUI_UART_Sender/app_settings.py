@@ -51,6 +51,20 @@ class AppSettings:
     def set_last_timeout(self, timeout: float) -> None:
         self._settings.setValue("serial/timeout", float(timeout))
 
+    def no_timeout(self, default: bool = False) -> bool:
+        return self._to_bool(self._settings.value("serial/no_timeout", default), default)
+
+    def set_no_timeout(self, enabled: bool) -> None:
+        self._settings.setValue("serial/no_timeout", bool(enabled))
+
+    # --- Config Tab ---
+    def config_ack_value(self, default: str = "OK") -> str:
+        value = self._settings.value("config/ack_value", default, str)
+        return str(value).strip() or default
+
+    def set_config_ack_value(self, value: str) -> None:
+        self._settings.setValue("config/ack_value", value or "OK")
+
     # --- TAP Sender ---
     def last_tap_dir(self) -> str:
         return str(self._settings.value("tap/last_dir", "", str))
@@ -64,6 +78,26 @@ class AppSettings:
 
     def set_ack_value(self, value: str) -> None:
         self._settings.setValue("tap/ack_value", value or "ok")
+
+    def queue_size(self, default: int = 1) -> int:
+        try:
+            val = int(self._settings.value("tap/queue_size", default))
+            return max(1, val)
+        except (TypeError, ValueError):
+            return default
+
+    def set_queue_size(self, size: int) -> None:
+        self._settings.setValue("tap/queue_size", max(1, int(size)))
+
+    def inter_cmd_delay_ms(self, default: int = 5) -> int:
+        try:
+            val = int(self._settings.value("tap/inter_cmd_delay_ms", default))
+            return max(0, val)
+        except (TypeError, ValueError):
+            return default
+
+    def set_inter_cmd_delay_ms(self, delay_ms: int) -> None:
+        self._settings.setValue("tap/inter_cmd_delay_ms", max(0, int(delay_ms)))
 
     # --- UART Terminal ---
     def terminal_hex_mode(self, default: bool = False) -> bool:
