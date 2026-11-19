@@ -274,6 +274,10 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.serial_mgr.connection_changed.connect(self._on_connection_changed)
         self.serial_mgr.port_error.connect(self._on_port_error)
+        self.config_tab.request_auto_connect.connect(self.on_connect_clicked)
+        self.config_tab.laser_config_synced.connect(
+            self.tap_tab.sync_laser_from_config
+        )
         self.tap_tab.request_auto_connect.connect(self.on_connect_clicked)
         self.tap_tab.transmission_state_changed.connect(
             self.config_tab.set_tap_transmission_active

@@ -1004,6 +1004,33 @@ class TapFileSenderTab(QWidget):
             )
             self.laser_status_lbl.setStyleSheet("color: #6c757d; font-weight: bold;")
 
+    def sync_laser_from_config(
+        self, mode_str: str, duty_str: str, freq_str: str
+    ) -> None:
+        """Tự động đồng bộ loại xung Laze và thông số từ Tab 1 (Config) sau khi đã Đọc ($0)."""
+        target_cmd = "Laze2" if str(mode_str).strip() == "2" else "Laze1"
+        idx = self.laser_type_combo.findData(target_cmd)
+
+        self.laser_type_combo.blockSignals(True)
+        if idx >= 0:
+            self.laser_type_combo.setCurrentIndex(idx)
+        self.laser_type_combo.blockSignals(False)
+
+        self._waiting_laser_ack = False
+        self._laser_ack_received = True
+        self._pending_laser_cmd = target_cmd
+        self._confirmed_laser_cmd = target_cmd
+
+        mode_label = "Loại 2 (PWM+PFM)" if target_cmd == "Laze2" else "Loại 1 (PFM)"
+        self.laser_status_lbl.setText(
+            f"● Đã đồng bộ từ Tab Config: {mode_label} ({target_cmd} — Duty: {duty_str}%, Freq: {freq_str} Hz)"
+        )
+        self.laser_status_lbl.setStyleSheet("color: #198754; font-weight: bold;")
+        self._append_log(
+            "INFO",
+            f"Đã tự động lấy cấu hình Laze từ Tab 1 ($0): {target_cmd} (Duty={duty_str}%, Freq={freq_str}Hz).",
+        )
+
     def _on_send_laser_request(self) -> None:
         if self.is_transmitting:
             QMessageBox.warning(

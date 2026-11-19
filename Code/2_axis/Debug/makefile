@@ -10,7 +10,6 @@ RM := rm -rf
 # All of the sources participating in the build are defined here
 -include sources.mk
 -include Drivers/STM32F1xx_HAL_Driver/Src/subdir.mk
--include Drivers/CMSIS/Device/ST/STM32F1xx/Source/Templates/subdir.mk
 -include Core/Startup/subdir.mk
 -include Core/Src/subdir.mk
 -include objects.mk
@@ -65,7 +64,7 @@ main-build: 2_axis.elf secondary-outputs
 
 # Tool invocations
 2_axis.elf 2_axis.map: $(OBJS) $(USER_OBJS) D:\Study_project\STM32_ALL_Project\2_axis\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "2_axis.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"D:\Study_project\STM32_ALL_Project\2_axis\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="2_axis.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+	arm-none-eabi-gcc -o "2_axis.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"D:\Study_project\STM32_ALL_Project\2_axis\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="2_axis.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -u _printf_float -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

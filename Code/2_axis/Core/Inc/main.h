@@ -49,6 +49,8 @@ extern "C" {
 
 /* USER CODE END EM */
 
+void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
+
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -73,6 +75,8 @@ void Error_Handler(void);
 #define MIN_Y_GPIO_Port GPIOB
 #define MAX_Y_Pin GPIO_PIN_15
 #define MAX_Y_GPIO_Port GPIOB
+#define Laze_pwm_Pin GPIO_PIN_8
+#define Laze_pwm_GPIO_Port GPIOA
 
 /* USER CODE BEGIN Private defines */
 
